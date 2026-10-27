@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Agent & Teamwork temporary artifacts
+.agents/
+PROJECT.md
+TEST_INFRA.md
+TEST_READY.md
+Tests/EmpiricalStressTest*.swift
+
+# Scratch binaries
+main
