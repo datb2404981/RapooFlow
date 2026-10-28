@@ -13,7 +13,7 @@ swiftc -O -warnings-as-errors \
   "$project_dir/Sources/ScrollMotion.swift" \
   "$project_dir/Sources/InputEngine.swift" \
   "$project_dir/Sources/main.swift" \
-  -framework AppKit -framework ApplicationServices -framework IOKit -framework CoreVideo \
+  -framework AppKit -framework ApplicationServices -framework IOKit -framework CoreVideo -framework ServiceManagement \
   -o "$app_dir/Contents/MacOS/RapooFlow"
 codesign --force --sign - "$app_dir"
 echo "$app_dir"

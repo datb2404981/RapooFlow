@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import ServiceManagement
 
 private final class PresetConfig: NSObject {
     let name: String
@@ -55,9 +56,11 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(status)
         menu.addItem(.separator())
 
-        addToggle(to: menu, "Smooth scrolling", prefs.smooth, #selector(toggleSmooth))
-        addToggle(to: menu, "Natural scrolling (wheel)", prefs.reverse, #selector(toggleReverse))
+        addToggle(to: menu, "Smooth scrolling (Cuộn mượt)", prefs.smooth, #selector(toggleSmooth))
+        addToggle(to: menu, "Reverse scroll (Đảo chiều chuột)", prefs.reverse, #selector(toggleReverse))
+        addToggle(to: menu, "Simulate trackpad phase", prefs.smoothSimTrackpad, #selector(toggleSimTrackpad))
         addToggle(to: menu, "Rapoo Forward → Paste, Back → Copy", prefs.buttonRemap, #selector(toggleButtons))
+        addToggle(to: menu, "Launch at login (Tự mở khi bật máy)", isLaunchAtLoginEnabled(), #selector(toggleLaunchAtLogin))
         menu.addItem(.separator())
 
         // Presets submenu
@@ -168,7 +171,29 @@ final class MenuController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleSmooth() { prefs.smooth.toggle() }
     @objc private func toggleReverse() { prefs.reverse.toggle() }
+    @objc private func toggleSimTrackpad() { prefs.smoothSimTrackpad.toggle() }
     @objc private func toggleButtons() { prefs.buttonRemap.toggle() }
+
+    private func isLaunchAtLoginEnabled() -> Bool {
+        if #available(macOS 13.0, *) {
+            return SMAppService.mainApp.status == .enabled
+        }
+        return false
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        if #available(macOS 13.0, *) {
+            do {
+                if SMAppService.mainApp.status == .enabled {
+                    try SMAppService.mainApp.unregister()
+                } else {
+                    try SMAppService.mainApp.register()
+                }
+            } catch {
+                NSLog("RapooFlow: Launch at login toggle error: \(error)")
+            }
+        }
+    }
     @objc private func setPreset(_ item: NSMenuItem) {
         guard let preset = item.representedObject as? PresetConfig else { return }
         prefs.step = preset.step

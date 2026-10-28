@@ -60,6 +60,14 @@ final class InputEngine: NSObject {
     private var caDisplayLink: Any?
     private var legacyDisplayLink: AnyObject?
     private var timer: Timer?
+    private var keeperTimer: Timer?
+    private var screenChangeTimer: Timer?
+    private let postQueue = DispatchQueue(label: "local.rapooflow.scrollposter.post", qos: .userInteractive)
+    private var scrollGeneration: UInt64 = 0
+    private var manualInputEnded = true
+    private var momentumActive = false
+    private var currentScrollPhase: Double = 0.0
+    private var currentMomentumPhase: Double = 0.0
 
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
@@ -123,11 +131,86 @@ final class InputEngine: NSObject {
         CFRunLoopAddSource(CFRunLoopGetMain(), source, CFRunLoopMode.commonModes)
         CGEvent.tapEnable(tap: newTap, enable: true)
         startRapooMonitor()
+        startLifecycleMonitors()
         isActive = true
         onStatusChanged?()
     }
 
+    private func startLifecycleMonitors() {
+        keeperTimer?.invalidate()
+        let keeper = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard AXIsProcessTrusted() else {
+                self.stop()
+                return
+            }
+            if let tap = self.tap, !CGEvent.tapIsEnabled(tap: tap) {
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+        }
+        RunLoop.main.add(keeper, forMode: .common)
+        keeperTimer = keeper
+
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(handleSystemWillSleep),
+            name: NSWorkspace.willSleepNotification, object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(handleSystemDidWake),
+            name: NSWorkspace.didWakeNotification, object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(handleSystemWillSleep),
+            name: NSWorkspace.sessionDidResignActiveNotification, object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(handleSystemDidWake),
+            name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil
+        )
+        NotificationCenter.default.removeObserver(self, name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleScreenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil
+        )
+    }
+
+    @objc private func handleSystemWillSleep() {
+        clearScroll()
+    }
+
+    @objc private func handleSystemDidWake() {
+        clearScroll()
+        if let tap, !CGEvent.tapIsEnabled(tap: tap) {
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+    }
+
+    @objc private func handleScreenParametersChanged() {
+        screenChangeTimer?.invalidate()
+        screenChangeTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            if #available(macOS 15.0, *) {
+                if let link = self.caDisplayLink as? CADisplayLink {
+                    link.invalidate()
+                }
+                self.caDisplayLink = nil
+            } else {
+                if let legacy = self.legacyDisplayLink as? LegacyDisplayLinkWrapper {
+                    legacy.stop()
+                }
+                self.legacyDisplayLink = nil
+            }
+        }
+    }
+
     func stop() {
+        keeperTimer?.invalidate()
+        keeperTimer = nil
+        screenChangeTimer?.invalidate()
+        screenChangeTimer = nil
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        NotificationCenter.default.removeObserver(self)
         clearScroll()
         if #available(macOS 15.0, *) {
             if let link = caDisplayLink as? CADisplayLink {
@@ -137,6 +220,10 @@ final class InputEngine: NSObject {
         }
         if let source = tapSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, CFRunLoopMode.commonModes)
+        }
+        if let tap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+            CFMachPortInvalidate(tap)
         }
         tapSource = nil
         tap = nil
@@ -226,8 +313,10 @@ final class InputEngine: NSObject {
         var fixX = event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2)
         var ptX = event.getDoubleValueField(.scrollWheelEventPointDeltaAxis2)
 
-        let natural = (event.copy().flatMap { NSEvent(cgEvent: $0) })?.isDirectionInvertedFromDevice ?? false
-        let dir = ScrollMotion.direction(invertedBySystem: natural, natural: prefs.reverse)
+        // Match Mos ScrollCore.swift:
+        // When prefs.reverse is true, invert raw event direction (just like Mos's "Reverse Scroll").
+        // When prefs.reverse is false, keep raw event direction untouched.
+        let dir: Double = prefs.reverse ? -1.0 : 1.0
         let amp: Double = flags.contains(.maskAlternate) ? 5.0 : 1.0
 
         // 2. Full 3-axis direction reversal
@@ -296,8 +385,11 @@ final class InputEngine: NSObject {
         template.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
 
         let now = CFAbsoluteTimeGetCurrent()
-        if target != scrollTarget || now - lastInputTime > 0.5 {
+        let separatedByTime = lastInputTime == 0.0 || (now - lastInputTime >= 0.45)
+        if target != scrollTarget || separatedByTime {
             motion.reset()
+            manualInputEnded = true
+            momentumActive = false
         }
         scrollTemplate = template
         scrollTarget = target
@@ -305,6 +397,22 @@ final class InputEngine: NSObject {
         if !motion.hasActiveMomentum {
             lastFrameTime = now - 1.0 / 120.0
         }
+
+        if prefs.smoothSimTrackpad {
+            if momentumActive {
+                emitPhaseFrame(template: template, target: target, scrollPhase: 0.0, momentumPhase: 3.0) // MomentumEnd
+                momentumActive = false
+            }
+            if manualInputEnded || separatedByTime {
+                emitPhaseFrame(template: template, target: target, scrollPhase: 1.0, momentumPhase: 0.0) // TrackingBegin
+                currentScrollPhase = 2.0 // TrackingOngoing
+                currentMomentumPhase = 0.0
+            } else {
+                currentScrollPhase = 2.0
+                currentMomentumPhase = 0.0
+            }
+        }
+        manualInputEnded = false
 
         motion.addInput(
             y: chosenY,
@@ -315,6 +423,22 @@ final class InputEngine: NSObject {
         )
 
         return nil
+    }
+
+    private func emitPhaseFrame(template: CGEvent, target: pid_t, scrollPhase: Double, momentumPhase: Double) {
+        guard let frame = template.copy() else { return }
+        frame.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
+        frame.setDoubleValueField(.scrollWheelEventIsContinuous, value: 1.0)
+        frame.setDoubleValueField(.scrollWheelEventScrollPhase, value: scrollPhase)
+        frame.setDoubleValueField(.scrollWheelEventMomentumPhase, value: momentumPhase)
+        frame.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: 0.0)
+        frame.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: 0.0)
+        frame.timestamp = DispatchTime.now().uptimeNanoseconds
+        let gen = scrollGeneration
+        postQueue.async { [weak self] in
+            guard let self, self.scrollGeneration == gen else { return }
+            frame.postToPid(target)
+        }
     }
 
     @objc private func caDisplayLinkDidFire(_ link: Any) {
@@ -368,10 +492,27 @@ final class InputEngine: NSObject {
 
     private func clearScroll() {
         stopFrameClock()
+        if let template = scrollTemplate, scrollTarget > 0 {
+            if Preferences.shared.smoothSimTrackpad {
+                if momentumActive {
+                    emitPhaseFrame(template: template, target: scrollTarget, scrollPhase: 0.0, momentumPhase: 3.0)
+                } else if !manualInputEnded {
+                    emitPhaseFrame(template: template, target: scrollTarget, scrollPhase: 4.0, momentumPhase: 0.0)
+                }
+            } else if let app = NSRunningApplication(processIdentifier: scrollTarget),
+                      app.bundleIdentifier == "com.google.Chrome" {
+                emitPhaseFrame(template: template, target: scrollTarget, scrollPhase: 4.0, momentumPhase: 0.0)
+            }
+        }
+        scrollGeneration &+= 1
         motion.reset()
         scrollTemplate = nil
         scrollTarget = 0
         lastFrameTime = 0
+        manualInputEnded = true
+        momentumActive = false
+        currentScrollPhase = 0.0
+        currentMomentumPhase = 0.0
     }
 
     private func tick() {
@@ -381,10 +522,19 @@ final class InputEngine: NSObject {
             return
         }
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastInputTime < 2.0, now - lastFrameTime < 0.25 else {
+        guard now - lastInputTime < 3.0, now - lastFrameTime < 0.5 else {
             clearScroll()
             return
         }
+
+        let simTrackpad = Preferences.shared.smoothSimTrackpad
+        if !manualInputEnded && lastInputTime > 0.0 && now - lastInputTime > 0.18 {
+            if simTrackpad {
+                emitPhaseFrame(template: template, target: scrollTarget, scrollPhase: 4.0, momentumPhase: 0.0) // TrackingEnd
+            }
+            manualInputEnded = true
+        }
+
         guard let frameDelta = motion.advanceFrame(
             durationTransition: Preferences.shared.durationTransition,
             deadZone: Preferences.shared.deadZone
@@ -394,20 +544,45 @@ final class InputEngine: NSObject {
         }
         lastFrameTime = now
 
-        guard let frame = template.copy() else { clearScroll(); return }
-        frame.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
-        frame.setDoubleValueField(.scrollWheelEventIsContinuous, value: 1.0)
-        frame.setIntegerValueField(.scrollWheelEventScrollPhase, value: 0)
-        frame.setIntegerValueField(.scrollWheelEventMomentumPhase, value: 0)
-        frame.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: frameDelta.dy)
-        frame.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: frameDelta.dx)
-        frame.timestamp = DispatchTime.now().uptimeNanoseconds
-
-        if diagnosticFrames < 8 {
-            diagnosticFrames += 1
-            diagnostic("FRAME y=\(frameDelta.dy) target=\(scrollTarget)")
+        if simTrackpad && manualInputEnded {
+            if !momentumActive {
+                momentumActive = true
+                currentScrollPhase = 0.0
+                currentMomentumPhase = 1.0 // MomentumBegin
+            } else {
+                currentScrollPhase = 0.0
+                currentMomentumPhase = 2.0 // MomentumOngoing
+            }
         }
-        frame.postToPid(scrollTarget)
+
+        let outputMagnitude = max(abs(frameDelta.dy), abs(frameDelta.dx))
+        if outputMagnitude > Preferences.shared.deadZone {
+            guard let frame = template.copy() else { clearScroll(); return }
+            frame.setIntegerValueField(.eventSourceUserData, value: Self.syntheticMarker)
+            frame.setDoubleValueField(.scrollWheelEventIsContinuous, value: 1.0)
+            if simTrackpad {
+                frame.setDoubleValueField(.scrollWheelEventScrollPhase, value: currentScrollPhase)
+                frame.setDoubleValueField(.scrollWheelEventMomentumPhase, value: currentMomentumPhase)
+            } else {
+                frame.setIntegerValueField(.scrollWheelEventScrollPhase, value: 0)
+                frame.setIntegerValueField(.scrollWheelEventMomentumPhase, value: 0)
+            }
+            frame.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: frameDelta.dy)
+            frame.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: frameDelta.dx)
+            frame.timestamp = DispatchTime.now().uptimeNanoseconds
+
+            if diagnosticFrames < 16 {
+                diagnosticFrames += 1
+                diagnostic("FRAME y=\(frameDelta.dy) target=\(scrollTarget)")
+            }
+            let target = scrollTarget
+            let gen = scrollGeneration
+            postQueue.async { [weak self] in
+                guard let self, self.scrollGeneration == gen else { return }
+                frame.postToPid(target)
+            }
+        }
+
         if !motion.hasActiveMomentum {
             clearScroll()
         }

@@ -58,6 +58,10 @@ public final class Preferences {
         }
         set { store.set(max(0.0, newValue), forKey: "deadZone") }
     }
+    public var smoothSimTrackpad: Bool {
+        get { store.object(forKey: "smoothSimTrackpad") == nil ? false : store.bool(forKey: "smoothSimTrackpad") }
+        set { store.set(newValue, forKey: "smoothSimTrackpad") }
+    }
     public var durationTransition: Double {
         let raw = Double(round(1000 * (1.0 - sqrt(duration / 5.2))) / 1000)
         return max(0.010, raw)

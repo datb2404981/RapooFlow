@@ -49,7 +49,10 @@ public final class ScrollMotion {
     public var deadZone: Double = 1.00
 
     public var hasActiveMomentum: Bool {
-        abs(buffer.y - current.y) > deadZone || abs(buffer.x - current.x) > deadZone
+        abs(buffer.y - current.y) > deadZone ||
+        abs(buffer.x - current.x) > deadZone ||
+        abs(filter.curveWindowY[1]) > deadZone ||
+        abs(filter.curveWindowX[1]) > deadZone
     }
 
     public var isEmpty: Bool {
@@ -158,23 +161,29 @@ public final class ScrollMotion {
 
     @discardableResult
     public func advanceFrame(durationTransition: Double, deadZone: Double) -> (dy: Double, dx: Double)? {
-        guard hasActiveMomentum else {
-            reset()
-            return nil
-        }
-
         let rawDeltaY = Interpolator.lerp(src: current.y, dest: buffer.y, trans: durationTransition)
         let rawDeltaX = Interpolator.lerp(src: current.x, dest: buffer.x, trans: durationTransition)
 
-        let smoothed = filter.fill(with: (y: rawDeltaY, x: rawDeltaX))
         current.y += rawDeltaY
         current.x += rawDeltaX
 
-        if abs(buffer.y - current.y) <= deadZone {
+        let smoothed = filter.fill(with: (y: rawDeltaY, x: rawDeltaX))
+
+        let residualY = abs(buffer.y - current.y)
+        let residualX = abs(buffer.x - current.x)
+        let residualMagnitude = max(residualY, residualX)
+        let outputMagnitude = max(abs(smoothed.y), abs(smoothed.x))
+
+        if residualY <= deadZone {
             current.y = buffer.y
         }
-        if abs(buffer.x - current.x) <= deadZone {
+        if residualX <= deadZone {
             current.x = buffer.x
+        }
+
+        if residualMagnitude <= deadZone && outputMagnitude <= deadZone {
+            reset()
+            return nil
         }
 
         return (dy: smoothed.y, dx: smoothed.x)
